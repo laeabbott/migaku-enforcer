@@ -1,0 +1,17 @@
+# Build artifacts (built via `pyinstaller migaku_enforcer.spec` / `iscc installer.iss`)
+build/
+dist/
+Output/
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime logs / debug dumps (real logs live in %APPDATA%\MigakuEnforcer, not here;
+# this only catches stray ones from running the source directly)
+*.log
+migaku_debug.html
+migaku_debug.txt
+
+# Local dev tooling, not part of the project
+.claude/

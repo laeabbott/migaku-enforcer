@@ -1,0 +1,6 @@
+selenium
+psutil
+pystray
+Pillow
+win10toast
+pyinstaller
