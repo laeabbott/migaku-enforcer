@@ -3,20 +3,21 @@
 A Windows tool that blocks distracting websites and closes distracting apps until
 you've finished your [Migaku](https://migaku.com) flashcard reviews for the day.
 
-Not officially associated with Migaku — this is an independent, unofficial tool made by
-a user for personal accountability, released here in case it's useful to others.
+**Not officially associated with Migaku**—this is an independent, unofficial tool I made to combat my 
+own avoidant tendencies, released here in case it's useful to others.
 
 ## What it does
 
-- Checks your review count on study.migaku.com periodically (Chrome, headless).
-- While reviews are pending: blocks a list of websites you choose (via the hosts file)
+- Checks your review count on study.migaku.com periodically using Selenium + headless Chrome. If
+  Chrome isn't found, the setup wizard's "Test Login" step will tell you..
+- While reviews are unfinished, it blocks a pre-chosen list of websites you choose
   and closes a list of apps/processes you choose.
-- Once you hit 0 reviews remaining, or a daily review goal you set, restrictions lift
+- Once you hit 0 reviews remaining, or a daily review goal you set (e.g. finish 100 cards), restrictions lift
   until a reset time you choose (default 4 AM).
 - A small number of monthly "Emergency Passes" for genuine emergencies, each requiring
   a moment of confirmation before use.
-- The main window can't be closed without a short reflection exercise, so it can't be
-  casually dismissed mid-restriction.
+- The main window can't be closed without a short reflection exercise to increase friction, so it can't be
+  casually dismissed mid-restriction. 
 
 ## Download
 
@@ -31,15 +32,14 @@ Windows will prompt for that the first time you launch it.
 
 ### A note on your credentials
 
-Your Migaku email/password are stored locally in `%APPDATA%\MigakuEnforcer\config.json`,
-in plain text, restricted to your Windows user account's file permissions. This is a
-deliberate tradeoff for a single-user local tool — see the tradeoffs below — but it does
-mean: don't use this on a shared or public computer.
+Your Migaku email/password are stored locally in APPDATA in plain text, 
+restricted to your Windows user account's file permissions, so be careful about using this 
+on a shared or public computer.
 
 ## Configuring it later
 
 Once reviews are done for the day, a **Settings** button unlocks on the main window
-(deliberately locked while restrictions are active — otherwise you could just remove
+(deliberately locked while restrictions are active, otherwise you could just remove
 your own blocks). From there you can change blocked sites/apps, your daily goal, reset
 time, check interval, emergency pass settings, and startup behavior.
 
@@ -59,15 +59,8 @@ iscc installer.iss                    # requires Inno Setup: https://jrsoftware.
 ```
 
 ## Design notes / known tradeoffs
-
-- **Plaintext credentials, not a credential manager**: the threat model for a
-  single-user local tool doesn't really change by adding encryption — anyone with local
-  file access to read the config already has full control of the machine. Keyring/DPAPI
-  would add a real packaging-fragility risk for little practical benefit here.
 - **Windows only.** Uses the Windows hosts file, Task Scheduler, and UAC elevation
   directly.
-- **Chrome required** — review checking uses Selenium against a headless Chrome. If
-  Chrome isn't found, the setup wizard's "Test Login" step will tell you.
 - Blocked-app matching is substring-based by default (blocking "steam" also matches any
   process containing that text); an exact-match mode is available in Settings.
 
