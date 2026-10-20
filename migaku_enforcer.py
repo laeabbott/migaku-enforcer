@@ -466,6 +466,15 @@ class MigakuEnforcer:
                 log('info', "SUCCESS: Completion indicator found - 0 reviews remaining")
                 return 0
 
+            # Fallback: current dashboard shows "100% ... Completed" on the
+            # Today's Reviews ring instead of a "0 reviews" phrase once the
+            # day's queue is cleared.
+            if re.search(r'100\s*%', body_text) and re.search(
+                r'\bCompleted\b', body_text, re.IGNORECASE
+            ):
+                log('info', "SUCCESS: 100% Completed indicator found - 0 reviews remaining")
+                return 0
+
             log('warning', "Could not find review count")
             return None
 
