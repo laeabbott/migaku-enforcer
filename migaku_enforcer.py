@@ -2171,7 +2171,7 @@ Admin privileges required for website blocking.""")
 
     # ---- Admin check ----
     if not check_admin_privileges():
-        if test_mode:
+        if test_mode or debug_html:
             print("WARNING: Not running as administrator! Website blocking will not work.")
         else:
             try:
