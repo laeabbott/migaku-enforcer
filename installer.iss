@@ -12,7 +12,7 @@
 ; something the installer does silently that the app would then have to reconcile.
 
 #define MyAppName "Migaku Enforcer"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.0.1"
 #define MyAppExeName "MigakuEnforcer.exe"
 
 [Setup]
