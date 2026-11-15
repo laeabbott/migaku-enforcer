@@ -24,12 +24,16 @@ own avoidant tendencies, released here in case it's useful to others.
 
 ## Download
 
-Grab the latest installer from the [Releases page](../../releases/latest) —
-`MigakuEnforcerSetup.exe`. It installs per-user (no admin needed to install), then walks
+Grab the latest installer from the [Releases page](../../releases/latest):
+
+- **Windows:** `MigakuEnforcerSetup.exe`
+- **Linux:** `migaku-enforcer-linux-<version>.tar.gz` (see [Linux](#linux-arch-and-others) below)
+
+The Windows installer installs per-user (no admin needed to install), then walks
 you through a setup wizard: your Migaku login, which sites/apps to block, your daily
 goal, and whether to start automatically at login.
 
-**Requirements:** Windows 10/11, Google Chrome installed. The app itself needs
+**Windows requirements:** Windows 10/11, Google Chrome installed. The app itself needs
 administrator privileges to run (it edits the hosts file and closes processes), so
 Windows will prompt for that the first time you launch it.
 
@@ -41,9 +45,33 @@ on a shared or public computer.
 
 ## Linux (Arch and others)
 
-Linux is supported from source (no packaged installer). The app runs as your normal
-user; only the `/etc/hosts` edit needs root, and that is handled by a tiny helper
-you install once.
+The app runs as your normal user; only the `/etc/hosts` edit needs root, and that is
+handled by a tiny helper that the installer sets up once.
+
+### Installer (recommended)
+
+Download `migaku-enforcer-linux-<version>.tar.gz` from the
+[Releases page](../../releases/latest), then:
+
+```bash
+tar xf migaku-enforcer-linux-*.tar.gz
+cd migaku-enforcer-linux-*/
+./install.sh            # as your normal user, not with sudo
+```
+
+It offers to install missing system packages with pacman, apt or dnf (Python's Tk
+module, plus python-gobject/libayatana-appindicator for the tray icon and libnotify),
+puts the app and its own Python venv in `~/.local/share/migaku-enforcer`, adds a
+"Migaku Enforcer" app-menu entry plus `migaku-enforcer` / `migaku-enforcer-uninstall`
+in `~/.local/bin`, and asks for your sudo password once to install the hosts helper.
+You also need Google Chrome (Arch: AUR `google-chrome`).
+
+Then start it from the app menu, or `migaku-enforcer --test` to try it with nothing
+blocked. To upgrade, run the new version's `install.sh` (settings are kept); also
+re-run it after a major distro Python upgrade (e.g. 3.13 to 3.14), which breaks the
+app's venv. Uninstall with `migaku-enforcer-uninstall`.
+
+### From source
 
 ```bash
 # 1. System packages (Arch): Tk for the GUI, Chrome for the review check
@@ -78,7 +106,8 @@ Notes:
 - Config and logs live in `~/.config/migaku-enforcer/` (config is `chmod 600`).
 - The helper only writes `127.0.0.1 <domain>` lines tagged `# MIGAKU_ENFORCER_BLOCKED`
   and validates every domain, so it can't be used to edit anything else in `/etc/hosts`.
-  Remove everything with `sudo ./linux/uninstall.sh`.
+  Remove everything with `sudo ./linux/uninstall.sh` (the installer's
+  `migaku-enforcer-uninstall` runs this for you).
 - The tray icon needs a StatusNotifier tray (Quickshell, Waybar's tray module, Plasma, ...)
   plus the two packages above. Without them, "Exit (Minimize to Tray)" just un-pins the
   window and leaves it open instead of hiding it, so it can never get lost.
@@ -107,11 +136,16 @@ To build the packaged installer yourself:
 pyinstaller migaku_enforcer.spec      # -> dist/MigakuEnforcer.exe
 iscc installer.iss                    # requires Inno Setup: https://jrsoftware.org/isinfo.php
                                        # -> Output/MigakuEnforcerSetup.exe
+python linux/build_tarball.py         # -> Output/migaku-enforcer-linux-<version>.tar.gz
 ```
 
+Both take their version number from `MyAppVersion` in `installer.iss`. The tarball
+script works on Windows too (it fixes line endings and file modes itself).
+
 ## Design notes / known tradeoffs
-- **Windows only.** Uses the Windows hosts file, Task Scheduler, and UAC elevation
-  directly.
+- **Windows and Linux.** Windows uses the hosts file, Task Scheduler and UAC
+  elevation directly; Linux uses a sudoers-limited hosts helper and systemd user units.
+  No macOS support.
 - Blocked-app matching is substring-based by default (blocking "steam" also matches any
   process containing that text); an exact-match mode is available in Settings.
 

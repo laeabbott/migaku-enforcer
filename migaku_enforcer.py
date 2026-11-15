@@ -2519,7 +2519,8 @@ def main():
   python migaku_enforcer.py --help       This help
 
 First run shows a setup wizard for your Migaku login and blocking preferences.
-Website blocking needs the one-time root setup:  sudo ./linux/install.sh""")
+Website blocking needs a one-time root setup. The Linux installer (./install.sh)
+does it for you; from a source checkout run:  sudo ./linux/install.sh""")
         else:
             _notify("""Migaku Study Enforcer - Usage:
 
@@ -2575,7 +2576,8 @@ Admin privileges required for website blocking.""")
     if not check_admin_privileges():
         if IS_LINUX:
             admin_msg = ("The hosts-file helper isn't installed.\n"
-                         "Website blocking needs a one-time setup. In a terminal, run:\n\n"
+                         "Website blocking needs a one-time setup. Re-run the Linux\n"
+                         "installer (./install.sh), or from a source checkout run:\n\n"
                          "    sudo ./linux/install.sh")
         else:
             admin_msg = ("Not running as administrator!\n"

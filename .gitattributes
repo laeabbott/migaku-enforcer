@@ -1,0 +1,4 @@
+# Linux scripts must keep LF endings even in a Windows checkout (core.autocrlf),
+# or bash/python on Linux choke on the \r.
+*.sh text eol=lf
+linux/migaku-hosts-helper text eol=lf
