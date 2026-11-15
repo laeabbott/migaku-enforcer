@@ -2371,19 +2371,52 @@ class MigakuStatusWindow:
                       f"{self.enforcer._reset_time_label()}.")
             return
         self.root.withdraw()
+        reason = "vacation day" if self.enforcer.on_vacation else "goal met"
         if getattr(self, '_tray_icon', None) is None:
-            menu = pystray.Menu(
-                pystray.MenuItem("Show Migaku Enforcer", self._restore_from_tray, default=True),
-                pystray.MenuItem("Exit", self._tray_exit),
-            )
-            self._tray_icon = pystray.Icon(
-                "migaku_enforcer", self._make_tray_image(), "Migaku Enforcer — goal met", menu)
-            self._tray_icon.run_detached()
-        self._log(f"Minimized to tray — goal met, resting until {self.enforcer._reset_time_label()}.")
+            self._tray_icon = self._start_tray_icon(f"Migaku Enforcer — {reason}")
+        self._log(f"Minimized to tray — {reason}, resting until {self.enforcer._reset_time_label()}.")
+
+    def _start_tray_icon(self, title: str):
+        """
+        Show the tray icon and return it.
+
+        Linux (GTK/AppIndicator backends): run_detached() would only *prepare* the
+        icon for a GLib main loop that Tk never runs, so it would never appear.
+        Instead the icon runs its own loop in a thread. That instance is kept for
+        the life of the process and just shown/hidden: a stopped AppIndicator item
+        stays registered with the tray until the process exits, so recreating it
+        on every minimize would leave stale entries behind.
+
+        Windows keeps the original create/run_detached/stop cycle.
+        """
+        if IS_LINUX:
+            icon = getattr(self, '_linux_tray_icon', None)
+            if icon is None:
+                icon = self._make_tray_icon(title)
+                self._linux_tray_icon = icon
+                threading.Thread(target=icon.run, name="TrayIcon", daemon=True).start()
+            else:
+                icon.title = title
+                icon.visible = True
+            return icon
+        icon = self._make_tray_icon(title)
+        icon.run_detached()
+        return icon
+
+    def _make_tray_icon(self, title: str):
+        menu = pystray.Menu(
+            pystray.MenuItem("Show Migaku Enforcer", self._restore_from_tray, default=True),
+            pystray.MenuItem("Exit", self._tray_exit),
+        )
+        return pystray.Icon("migaku_enforcer", self._make_tray_image(), title, menu)
 
     def _stop_tray(self):
-        if getattr(self, '_tray_icon', None) is not None:
-            self._tray_icon.stop()
+        icon = getattr(self, '_tray_icon', None)
+        if icon is not None:
+            if IS_LINUX:
+                icon.visible = False  # hide, keep the instance (see _start_tray_icon)
+            else:
+                icon.stop()
             self._tray_icon = None
 
     def _restore_from_tray(self, icon=None, item=None):

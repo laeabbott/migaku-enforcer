@@ -47,11 +47,12 @@ you install once.
 
 ```bash
 # 1. System packages (Arch): Tk for the GUI, Chrome for the review check
-sudo pacman -S tk python
+sudo pacman -S tk python python-gobject libayatana-appindicator
 #    plus google-chrome (AUR) or chromium; Selenium downloads a matching chromedriver itself
+#    (python-gobject + libayatana-appindicator are only for the tray icon; optional)
 
-# 2. Python deps in a venv
-python -m venv .venv
+# 2. Python deps in a venv (--system-site-packages lets it see python-gobject for the tray)
+python -m venv --system-site-packages .venv
 .venv/bin/pip install selenium psutil pystray Pillow
 
 # 3. One-time root setup: installs /usr/local/lib/migaku-enforcer/hosts-helper and a
@@ -78,9 +79,9 @@ Notes:
 - The helper only writes `127.0.0.1 <domain>` lines tagged `# MIGAKU_ENFORCER_BLOCKED`
   and validates every domain, so it can't be used to edit anything else in `/etc/hosts`.
   Remove everything with `sudo ./linux/uninstall.sh`.
-- The tray icon only works with a StatusNotifier tray (needs `python-gobject` +
-  `libayatana-appindicator`; use `--system-site-packages` for the venv). Without one,
-  the window just stays open (un-pinned) once your goal is met instead of hiding.
+- The tray icon needs a StatusNotifier tray (Quickshell, Waybar's tray module, Plasma, ...)
+  plus the two packages above. Without them, "Exit (Minimize to Tray)" just un-pins the
+  window and leaves it open instead of hiding it, so it can never get lost.
 - The window asks to stay on top, which Wayland compositors treat as a hint. On Hyprland
   add a rule such as `windowrule = float, title:^Migaku Enforcer`.
 - Blocked apps are matched against the process name as shown by `ps` (e.g. `steam`,
