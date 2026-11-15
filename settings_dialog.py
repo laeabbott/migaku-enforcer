@@ -25,8 +25,8 @@ from migaku_enforcer import (
     DEFAULT_BLOCKED_DOMAINS, DEFAULT_BLOCKED_APPS, DEFAULT_DAILY_REVIEW_GOAL,
     DEFAULT_RESET_HOUR, DEFAULT_EMERGENCY_PASSES_ENABLED,
     DEFAULT_EMERGENCY_PASSES_PER_MONTH, DEFAULT_CHECK_INTERVAL_MINUTES,
-    DEFAULT_BLOCKED_APPS_EXACT_MATCH,
-    check_admin_privileges, install_startup, uninstall_startup,
+    DEFAULT_BLOCKED_APPS_EXACT_MATCH, REVIEW_COUNT_VACATION,
+    check_admin_privileges, install_startup, uninstall_startup, STARTUP_NEEDS_ADMIN,
 )
 
 WINDOW_WIDTH = 460
@@ -141,7 +141,11 @@ class SettingsWindow(tk.Toplevel):
 
         def on_result(count, error_kind):
             test_btn.config(state='normal', text="Test Login")
-            if error_kind is None:
+            if error_kind is None and count == REVIEW_COUNT_VACATION:
+                result_label.config(
+                    text="✓ Login successful! Vacation mode today — nothing is restricted.",
+                    fg=FG_GOOD)
+            elif error_kind is None:
                 result_label.config(text=f"✓ Login successful! {count} review(s) pending.",
                                      fg=FG_GOOD)
             elif error_kind == 'chrome_missing':
@@ -193,8 +197,8 @@ class SettingsWindow(tk.Toplevel):
         tk.Label(
             frame, wraplength=WINDOW_WIDTH - 40, justify='left', font=FONT_BODY,
             fg=FG_MUTED, bg=BG,
-            text="Start Migaku Enforcer automatically when you log in. Requires "
-                 "administrator privileges."
+            text="Start Migaku Enforcer automatically when you log in."
+                 + (" Requires administrator privileges." if STARTUP_NEEDS_ADMIN else "")
         ).pack(anchor='w', pady=(0, 10))
 
         tk.Checkbutton(
@@ -208,7 +212,7 @@ class SettingsWindow(tk.Toplevel):
         # Applies immediately (not deferred to Save) — this toggle reflects real
         # Task Scheduler state, not just a stored preference.
         wants_startup = self._startup_var.get()
-        if not check_admin_privileges():
+        if STARTUP_NEEDS_ADMIN and not check_admin_privileges():
             self._startup_var.set(not wants_startup)  # revert
             messagebox.showwarning(
                 "Migaku Enforcer",
@@ -266,7 +270,7 @@ class SettingsWindow(tk.Toplevel):
         new_reset_hour = self.enforcer.config['reset_hour']
         if (new_reset_hour != old_reset_hour
                 and self.enforcer.config.get('install_to_startup')
-                and check_admin_privileges()):
+                and (not STARTUP_NEEDS_ADMIN or check_admin_privileges())):
             # The scheduled task's daily trigger time is baked in at
             # registration — re-register it so it actually matches the new
             # reset time instead of silently firing at the old one.

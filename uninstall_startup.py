@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Run this script once to remove Migaku Enforcer from Windows startup.
-It will ask for administrator permission via the UAC prompt.
+Run this script once to remove Migaku Enforcer from startup.
+Windows: asks for administrator permission via the UAC prompt.
+Linux:   removes the systemd user units (no root needed).
 """
 import sys
 import os
@@ -24,7 +25,7 @@ def relaunch_as_admin():
     return int(ret) > 32
 
 
-if not is_admin():
+if sys.platform == 'win32' and not is_admin():
     print("Requesting administrator privileges...")
     if relaunch_as_admin():
         sys.exit(0)

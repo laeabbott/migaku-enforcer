@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Migaku Study Enforcer - Complete Fixed Version
-A Windows 11 Python script that manages internet and application access
+A Windows 11 / Linux Python script that manages internet and application access
 based on review count on study.migaku.com
 
 Key Improvements:
@@ -17,6 +17,7 @@ import os
 import sys
 import time
 import json
+import shutil
 import subprocess
 import threading
 from datetime import datetime, timedelta
@@ -46,8 +47,24 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import psutil
 import logging
 from typing import Optional
-import pystray
 from PIL import Image, ImageDraw
+
+try:
+    import pystray
+except Exception:  # no usable tray backend (e.g. no display/Xlib on Linux)
+    pystray = None
+
+# ---- Platform ---------------------------------------------------------------
+IS_WINDOWS = sys.platform == 'win32'
+IS_LINUX = sys.platform.startswith('linux')
+
+# Windows: needs an elevated process to write the hosts file.
+# Linux: the app runs as a normal user; only /etc/hosts edits are privileged and go
+# through a root-owned helper allowed via sudoers (see linux/install.sh).
+HOSTS_PATH = (Path("C:/Windows/System32/drivers/etc/hosts") if IS_WINDOWS
+              else Path("/etc/hosts"))
+LINUX_HOSTS_HELPER = "/usr/local/lib/migaku-enforcer/hosts-helper"
+HOSTS_BLOCKED_MARKER = "# MIGAKU_ENFORCER_BLOCKED"
 
 # Simplified logging - add a test_mode parameter
 
@@ -102,9 +119,28 @@ DEFAULT_EMERGENCY_PASSES_PER_MONTH = 3
 DEFAULT_CHECK_INTERVAL_MINUTES = 60
 DEFAULT_BLOCKED_APPS_EXACT_MATCH = False  # substring match, matches pre-existing behavior
 
+# Returned by get_review_count() (alongside -1 = check failed, >= 0 = reviews due)
+# when Migaku's study page is showing vacation mode ("Enjoy Your Time Off!"). It is
+# deliberately not a count: vacation days owe no reviews and get no restrictions.
+REVIEW_COUNT_VACATION = -2
+
 
 def get_app_data_dir() -> Path:
-    """Per-user app data directory for config/logs (%APPDATA%\\MigakuEnforcer)."""
+    """
+    Per-user app data directory for config/logs.
+    Windows: %APPDATA%\\MigakuEnforcer. Linux: $XDG_CONFIG_HOME/migaku-enforcer
+    (default ~/.config/migaku-enforcer).
+    """
+    if IS_LINUX:
+        xdg = os.environ.get('XDG_CONFIG_HOME')
+        base_dir = Path(xdg) if xdg else Path.home() / ".config"
+        app_dir = base_dir / "migaku-enforcer"
+        app_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(app_dir, 0o700)  # config holds the Migaku password
+        except OSError:
+            pass
+        return app_dir
     base = os.environ.get('APPDATA')
     app_dir = Path(base) / "MigakuEnforcer" if base else Path.home() / ".migaku_enforcer"
     app_dir.mkdir(parents=True, exist_ok=True)
@@ -113,12 +149,19 @@ def get_app_data_dir() -> Path:
 
 def _lock_file_to_current_user(path: Path) -> None:
     """
-    Restrict a file's ACL to the current Windows user only.
+    Restrict a file's permissions to the current user only (ACL on Windows,
+    mode 0600 on Linux).
 
     Credentials are stored in plaintext JSON (see config docs), so this is the
     practical mitigation: narrow it from "readable by anyone with local access"
     to "readable by this user account only". Best-effort — never fatal.
     """
+    if not IS_WINDOWS:
+        try:
+            os.chmod(path, 0o600)
+        except OSError as e:
+            log('warning', f"Could not lock config file permissions: {e}")
+        return
     try:
         username = os.environ.get('USERNAME')
         if not username:
@@ -168,6 +211,7 @@ class MigakuEnforcer:
         self.current_status = "Starting up..."
         self._gui_messages = []
         self.reviews_complete = False  # set True to trigger auto-close
+        self.on_vacation = False  # True while Migaku shows vacation mode (no restrictions)
 
     def _migrate_legacy_config(self) -> None:
         """
@@ -217,7 +261,8 @@ class MigakuEnforcer:
             "consecutive_errors": 0,
             "reviews_completed_today": 0,
             "last_seen_review_count": None,
-            "progress_date": None
+            "progress_date": None,
+            "vacation_day": None  # ISO date a check last saw vacation mode on, else None
         }
 
         if self.config_file.exists():
@@ -267,10 +312,12 @@ class MigakuEnforcer:
         so webdriver.Chrome() fails even though a perfectly usable driver is
         already sitting in the cache from a previous successful run.
         """
-        cache_dir = Path.home() / ".cache" / "selenium" / "chromedriver" / "win64"
+        platform_dir, exe_name = (("win64", "chromedriver.exe") if IS_WINDOWS
+                                  else ("linux64", "chromedriver"))
+        cache_dir = Path.home() / ".cache" / "selenium" / "chromedriver" / platform_dir
         if not cache_dir.exists():
             return None
-        candidates = [d / "chromedriver.exe" for d in cache_dir.iterdir() if d.is_dir()]
+        candidates = [d / exe_name for d in cache_dir.iterdir() if d.is_dir()]
         candidates = [c for c in candidates if c.exists()]
         if not candidates:
             return None
@@ -417,8 +464,41 @@ class MigakuEnforcer:
         except Exception as e:
             log('error', f"Could not save debug files: {e}")
 
+    def _is_vacation_day(self, body_text: str) -> bool:
+        """
+        True if Migaku's study page is in vacation mode (no cards shown).
+
+        Vacation mode replaces the dashboard's review ring with a "HomeDayOff"
+        panel: "Enjoy Your Time Off! / We'll be here when you get back / [Edit
+        Schedule]". The page still lists per-deck "N reviews" figures underneath,
+        so this must be checked BEFORE the review-count regex or those would be
+        misread as reviews due.
+
+        Fails safe against false positives (which would silently lift every
+        restriction): the visible panel component, or the specific heading
+        together with the Edit Schedule button — never just the button, which
+        could plausibly exist on a normal day too.
+        """
+        try:
+            if self.driver and self.driver.execute_script(
+                'var e = document.querySelector(".HomeDayOff");'
+                'return !!(e && e.getClientRects().length > 0);'
+            ):
+                return True
+        except Exception as e:
+            log('warning', f"Vacation DOM check failed, using page text only: {e}")
+
+        return bool(
+            re.search(r'enjoy\s+your\s+time\s+off', body_text, re.IGNORECASE)
+            and re.search(r'edit\s+schedule', body_text, re.IGNORECASE)
+        )
+
     def get_review_count_dom_scraping(self) -> Optional[int]:
-        """Extract review count from page text."""
+        """
+        Extract review count from page text.
+        Returns the count, REVIEW_COUNT_VACATION on a vacation day, or None if
+        nothing recognisable was found.
+        """
 
         if not self.driver:
             log('error', "WebDriver not initialized")
@@ -447,6 +527,10 @@ class MigakuEnforcer:
             if getattr(self, 'test_mode', False):
                 log('info', f"Page URL: {self.driver.current_url}")
                 log('info', f"Page text (first 400 chars): {body_text[:400]}")
+
+            if self._is_vacation_day(body_text):
+                log('info', "Vacation mode detected - no reviews due, no restrictions today")
+                return REVIEW_COUNT_VACATION
 
             # Match "N review" or "N reviews" with word boundary so "reviewed"
             # is never mistaken for a pending count.
@@ -548,6 +632,9 @@ class MigakuEnforcer:
                     if review_count is not None:
                         self.config['last_successful_check'] = datetime.now(
                         ).isoformat()
+                        self.config['vacation_day'] = (
+                            datetime.now().date().isoformat()
+                            if review_count == REVIEW_COUNT_VACATION else None)
                         self.config['consecutive_errors'] = 0
                         self.save_config()
                         return review_count
@@ -799,8 +886,11 @@ class MigakuEnforcer:
             log('info', msg)
             self._gui_messages.append(msg)
             return True
-        hosts_path = Path("C:/Windows/System32/drivers/etc/hosts")
-        blocked_marker = "# MIGAKU_ENFORCER_BLOCKED"
+        if IS_LINUX and os.geteuid() != 0:
+            return self._modify_hosts_via_helper(block)
+
+        hosts_path = HOSTS_PATH
+        blocked_marker = HOSTS_BLOCKED_MARKER
 
         try:
             # Check if we can write to hosts file
@@ -847,8 +937,12 @@ class MigakuEnforcer:
 
             # Flush DNS cache
             try:
-                subprocess.run(['ipconfig', '/flushdns'],
-                               shell=True, capture_output=True, timeout=30)
+                if IS_WINDOWS:
+                    subprocess.run(['ipconfig', '/flushdns'],
+                                   shell=True, capture_output=True, timeout=30)
+                elif shutil.which('resolvectl'):
+                    subprocess.run(['resolvectl', 'flush-caches'],
+                                   capture_output=True, timeout=30)
                 log('info', "DNS cache flushed")
             except subprocess.TimeoutExpired:
                 log(
@@ -863,6 +957,34 @@ class MigakuEnforcer:
         except Exception as e:
             log('error', f"Error modifying hosts file: {e}")
             return False
+
+    def _modify_hosts_via_helper(self, block: bool) -> bool:
+        """
+        Linux, non-root: ask the sudoers-approved helper (linux/install.sh) to edit
+        /etc/hosts. The helper validates the domain list and only ever touches
+        lines carrying our marker.
+        """
+        cmd = ['sudo', '-n', LINUX_HOSTS_HELPER, 'block' if block else 'unblock']
+        if block:
+            cmd += [str(d) for d in self.config['blocked_domains']]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            log('error', "Hosts helper timed out")
+            return False
+        except OSError as e:
+            log('error', f"Could not run hosts helper: {e}")
+            return False
+
+        if result.stderr.strip():
+            log('warning', f"Hosts helper: {result.stderr.strip()}")
+        if result.returncode != 0:
+            log('error',
+                "Could not modify /etc/hosts via the helper (is it installed? "
+                "run: sudo ./linux/install.sh)")
+            return False
+        log('info', f"{'Blocking' if block else 'Unblocking'} domains via hosts helper")
+        return True
 
     def _reset_time_label(self) -> str:
         """Human-readable form of the configured reset_hour, e.g. '4 AM'."""
@@ -989,6 +1111,34 @@ class MigakuEnforcer:
         goal = self.config.get('daily_review_goal', DEFAULT_DAILY_REVIEW_GOAL)
         return f"{goal} reviews completed today! (cumulative: {done})"
 
+    def _enter_vacation_mode(self) -> None:
+        """
+        Vacation day: nothing is due, so nothing is restricted. State only — the
+        caller lifts the hosts block (the enforcement loop does so on its own when
+        are_restrictions_active() returns False).
+
+        Deliberately does NOT set restrictions_disabled_until: that would stay
+        lifted until the next reset even if vacation is switched off mid-day.
+        Leaving it unset means the normal check interval re-verifies it.
+        reviews_complete is reused only so Settings unlock and Exit needs no
+        reflection, as on any day with no restrictions.
+        """
+        if not self.on_vacation:
+            log('info', "Vacation day - restrictions off")
+        self.on_vacation = True
+        self.reviews_complete = True
+        self.current_status = "Vacation day - no restrictions."
+
+    def _leave_vacation_mode(self) -> None:
+        """Vacation ended (or was switched off) while we were relying on it."""
+        if not self.on_vacation:
+            return
+        log('info', "Vacation mode no longer active - restrictions resume")
+        self.on_vacation = False
+        self.reviews_complete = False
+        # The loop reuses its last state between review checks; make it re-apply now.
+        self._last_restriction_state = True
+
     def are_restrictions_active(self) -> bool:
         """
         Determine if restrictions should be active
@@ -1020,6 +1170,21 @@ class MigakuEnforcer:
         # Get review count
         review_count = self.get_review_count()
         self.current_review_count = review_count
+
+        if review_count == REVIEW_COUNT_VACATION:
+            self._enter_vacation_mode()
+            return False
+
+        if (review_count == -1 and self.config.get('vacation_day')
+                == datetime.now().date().isoformat()):
+            # A check earlier today saw vacation mode; one flaky re-check must not
+            # slam restrictions back on during a day that owes no reviews.
+            log('warning', "Could not re-check reviews, but today is a vacation day - staying unrestricted")
+            self._enter_vacation_mode()
+            self.current_status = "Vacation day - no restrictions (re-check failed)."
+            return False
+
+        self._leave_vacation_mode()
 
         if review_count == -1:
             # Error getting count - check consecutive errors
@@ -1073,8 +1238,8 @@ class MigakuEnforcer:
         Check if restrictions are currently active by examining hosts file
         Returns True if blocked entries exist, False otherwise
         """
-        hosts_path = Path("C:/Windows/System32/drivers/etc/hosts")
-        blocked_marker = "# MIGAKU_ENFORCER_BLOCKED"
+        hosts_path = HOSTS_PATH
+        blocked_marker = HOSTS_BLOCKED_MARKER
 
         try:
             if not hosts_path.exists():
@@ -1217,6 +1382,17 @@ class MigakuEnforcer:
     def show_notification(self, message: str) -> None:
         """Show system notification to user"""
         try:
+            # Linux: desktop notification via libnotify's notify-send
+            if IS_LINUX and shutil.which('notify-send'):
+                try:
+                    subprocess.run(
+                        ['notify-send', '--app-name=Migaku Enforcer',
+                         'Migaku Study Enforcer', message],
+                        capture_output=True, timeout=10, check=True)
+                    return
+                except Exception:
+                    pass
+
             # Try Windows 10/11 toast notification first
             try:
                 import win10toast
@@ -1351,6 +1527,14 @@ class MigakuEnforcer:
                         print("❌ Error checking reviews. Please try again.")
                         continue
 
+                    if review_count == REVIEW_COUNT_VACATION:
+                        self._enter_vacation_mode()
+                        self.modify_hosts_file(block=False)
+                        self._websites_blocked = False
+                        print("🏖️  Vacation day - no reviews due and no restrictions today.\n")
+                        continue
+                    self._leave_vacation_mode()
+
                     self._update_progress(review_count)
 
                     if self._reviews_done(review_count):
@@ -1429,12 +1613,136 @@ class MigakuEnforcer:
 
 
 def check_admin_privileges() -> bool:
-    """Check if script is running with administrator privileges"""
+    """
+    Can this process modify the hosts file?
+    Windows: running elevated. Linux: running as root, or the sudoers-approved
+    hosts helper (linux/install.sh) is installed and usable by this user.
+    """
+    if IS_LINUX:
+        if os.geteuid() == 0:
+            return True
+        # `sudo -l` can demand a password even when our rule is NOPASSWD, so run
+        # the helper's no-op `check` instead of asking sudo about it.
+        try:
+            result = subprocess.run(
+                ['sudo', '-n', LINUX_HOSTS_HELPER, 'check'],
+                capture_output=True, text=True, timeout=10)
+            return result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
     try:
         import ctypes
         return ctypes.windll.shell32.IsUserAnAdmin()
     except Exception:
         return False
+
+
+# Registering/removing the startup entry: needs elevation on Windows (Task
+# Scheduler, run level highest) but not on Linux (systemd *user* units).
+STARTUP_NEEDS_ADMIN = IS_WINDOWS
+
+SYSTEMD_UNIT_NAME = "migaku-enforcer"
+
+
+def _systemd_user_dir() -> Path:
+    xdg = os.environ.get('XDG_CONFIG_HOME')
+    return (Path(xdg) if xdg else Path.home() / ".config") / "systemd" / "user"
+
+
+def _systemd_quote(arg: str) -> str:
+    """Quote one ExecStart word (systemd: "..." with \\ and " escaped, % doubled)."""
+    escaped = arg.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%')
+    return f'"{escaped}"'
+
+
+def _systemctl_user(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(['systemctl', '--user', *args],
+                          capture_output=True, text=True, timeout=30)
+
+
+def _install_startup_linux(reset_hour: int) -> None:
+    """
+    systemd user units: a service started at login (after a short delay, so the
+    desktop session environment has settled) plus a timer that (re)starts it at
+    the daily reset hour — the Linux equivalent of the Windows task's logon +
+    daily triggers. Restart=on-failure mirrors the task's RestartOnFailure.
+    """
+    if getattr(sys, 'frozen', False):
+        exec_words = [sys.executable, '--no-relaunch', '--scheduled']
+        workdir = os.path.dirname(sys.executable)
+    else:
+        script_path = os.path.abspath(__file__)
+        exec_words = [sys.executable, script_path, '--no-relaunch', '--scheduled']
+        workdir = os.path.dirname(script_path)
+
+    exec_start = ' '.join(_systemd_quote(w) for w in exec_words)
+    service = f'''[Unit]
+Description=Migaku Study Enforcer - blocks distractions until Migaku reviews are done
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 30
+ExecStart={exec_start}
+WorkingDirectory={workdir.replace('%', '%%')}
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target
+'''
+    timer = f'''[Unit]
+Description=Daily Migaku Study Enforcer restart at reset time
+
+[Timer]
+OnCalendar=*-*-* {reset_hour:02d}:00:00
+Persistent=true
+Unit={SYSTEMD_UNIT_NAME}.service
+
+[Install]
+WantedBy=timers.target
+'''
+    unit_dir = _systemd_user_dir()
+    try:
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        (unit_dir / f"{SYSTEMD_UNIT_NAME}.service").write_text(service, encoding='utf-8')
+        (unit_dir / f"{SYSTEMD_UNIT_NAME}.timer").write_text(timer, encoding='utf-8')
+    except OSError as e:
+        log('error', f"Error writing systemd units: {e}")
+        return
+
+    try:
+        # `enable` (not --now) for the service: the app is normally already running
+        # when this is called, and we must not start a second copy of it.
+        for cmd in (['daemon-reload'],
+                    ['enable', f'{SYSTEMD_UNIT_NAME}.service'],
+                    ['enable', '--now', f'{SYSTEMD_UNIT_NAME}.timer']):
+            result = _systemctl_user(*cmd)
+            if result.returncode != 0:
+                log('error', f"systemctl --user {' '.join(cmd)} failed: {result.stderr.strip()}")
+                return
+        log('info', "Successfully installed startup service!")
+        log('info', "The enforcer will start automatically when you log in.")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log('error', f"Error running systemctl: {e}")
+
+
+def _uninstall_startup_linux() -> None:
+    try:
+        # Never `--now` the service: Settings can call this from inside the running
+        # app, which systemd would then stop.
+        _systemctl_user('disable', '--now', f'{SYSTEMD_UNIT_NAME}.timer')
+        _systemctl_user('disable', f'{SYSTEMD_UNIT_NAME}.service')
+        unit_dir = _systemd_user_dir()
+        for suffix in ('service', 'timer'):
+            try:
+                (unit_dir / f"{SYSTEMD_UNIT_NAME}.{suffix}").unlink()
+            except FileNotFoundError:
+                pass
+        _systemctl_user('daemon-reload')
+        log('info', "Startup service removed successfully!")
+    except Exception as e:
+        log('error', f"Error removing startup service: {e}")
 
 
 def install_startup(reset_hour: int = DEFAULT_RESET_HOUR) -> None:
@@ -1446,7 +1754,13 @@ def install_startup(reset_hour: int = DEFAULT_RESET_HOUR) -> None:
     actually matches what the user picked in the wizard/Settings. Re-calling
     this (idempotent — schtasks /create uses /f to overwrite) after the user
     changes reset_hour is how that setting propagates to the scheduled task.
+
+    On Linux this installs systemd user units instead (no elevation needed).
     """
+    if IS_LINUX:
+        _install_startup_linux(reset_hour)
+        return
+
     if not check_admin_privileges():
         log(
             'error', "Administrator privileges required for startup installation")
@@ -1570,6 +1884,9 @@ def install_startup(reset_hour: int = DEFAULT_RESET_HOUR) -> None:
 
 def uninstall_startup() -> None:
     """Remove startup task"""
+    if IS_LINUX:
+        _uninstall_startup_linux()
+        return
     try:
         result = subprocess.run([
             'schtasks', '/delete', '/tn', 'MigakuStudyEnforcer', '/f'
@@ -1827,7 +2144,9 @@ class MigakuStatusWindow:
         self.log_text.configure(state='disabled')
 
     def _update_count_display(self, count):
-        if self.enforcer.reviews_complete:
+        if self.enforcer.on_vacation or count == REVIEW_COUNT_VACATION:
+            self.count_label.config(text="Vacation day - no restrictions", fg='#00ff88')
+        elif self.enforcer.reviews_complete:
             self.count_label.config(
                 text=f"Goal met! Resting until {self.enforcer._reset_time_label()}", fg='#00ff88')
         elif count is None:
@@ -1861,7 +2180,11 @@ class MigakuStatusWindow:
         # Log a one-time message when goal is met (no auto-close — stay alive for the reset)
         if self.enforcer.reviews_complete and not getattr(self, '_showed_done', False):
             self._showed_done = True
-            self._log(f"Goal met! Enforcement resumes automatically at {self.enforcer._reset_time_label()}.")
+            if self.enforcer.on_vacation:
+                self._log("Vacation day - no restrictions. Migaku is re-checked on the normal "
+                          "interval, so restrictions return if vacation mode ends.")
+            else:
+                self._log(f"Goal met! Enforcement resumes automatically at {self.enforcer._reset_time_label()}.")
             self.exit_btn.config(text="Exit (Minimize to Tray)")
 
         # If a new day arrived (reviews_complete reset by the daily expiry), clear the flag
@@ -1897,7 +2220,18 @@ class MigakuStatusWindow:
             count = self.enforcer.get_review_count()
             self.enforcer.current_review_count = count
 
+            if count == REVIEW_COUNT_VACATION:
+                self.enforcer._enter_vacation_mode()
+                if not self.test_mode:
+                    self.enforcer.modify_hosts_file(block=False)
+                self.enforcer._websites_blocked = False
+                self.enforcer._gui_messages.append(
+                    "Vacation day - no reviews due and no restrictions today.")
+                self.root.after(0, lambda: self.check_btn.config(
+                    state='normal', text="Check Reviews"))
+                return
             if count >= 0:
+                self.enforcer._leave_vacation_mode()
                 self.enforcer._update_progress(count)
 
             if count >= 0 and self.enforcer._reviews_done(count):
@@ -2014,7 +2348,28 @@ class MigakuStatusWindow:
         draw.ellipse((8, 8, 56, 56), fill='#e94560')
         return image
 
+    @staticmethod
+    def _tray_usable() -> bool:
+        """
+        Whether hiding to the tray is safe (i.e. the user can get the window back).
+        On Linux only the StatusNotifier/AppIndicator backend shows up in
+        Wayland bars (Waybar, Plasma, ...); pystray's X11/GTK fallbacks can
+        "succeed" while nothing is visible, which would strand a withdrawn window.
+        """
+        if pystray is None:
+            return False
+        if IS_LINUX:
+            return pystray.Icon.__module__.endswith('_appindicator')
+        return True
+
     def _hide_to_tray(self):
+        if not self._tray_usable():
+            # No reliable tray: keep the window reachable, just get it out of the way.
+            self.root.attributes('-topmost', False)
+            self.root.lower()
+            self._log("No system tray available — window kept open, resting until "
+                      f"{self.enforcer._reset_time_label()}.")
+            return
         self.root.withdraw()
         if getattr(self, '_tray_icon', None) is None:
             menu = pystray.Menu(
@@ -2119,7 +2474,21 @@ def main():
         _notify("Startup task removed.")
         return
     if '--help' in args:
-        _notify("""Migaku Study Enforcer - Usage:
+        if IS_LINUX:
+            _notify("""Migaku Study Enforcer - Usage:
+
+  python migaku_enforcer.py              Run normally
+  python migaku_enforcer.py --test       Test mode: GUI shown, nothing blocked
+  python migaku_enforcer.py --debug-html Visible browser + save page HTML for diagnosis
+  python migaku_enforcer.py --reset      Clear today's "done" state and re-check reviews
+  python migaku_enforcer.py --install    Install systemd user service (start at login)
+  python migaku_enforcer.py --uninstall  Remove systemd user service
+  python migaku_enforcer.py --help       This help
+
+First run shows a setup wizard for your Migaku login and blocking preferences.
+Website blocking needs the one-time root setup:  sudo ./linux/install.sh""")
+        else:
+            _notify("""Migaku Study Enforcer - Usage:
 
   migaku_enforcer.exe              Run normally (hides terminal window)
   migaku_enforcer.exe --test       Test mode: GUI shown, nothing blocked
@@ -2150,8 +2519,8 @@ Admin privileges required for website blocking.""")
     # Not needed (and not possible) in a frozen build: sys.executable IS the app
     # itself there, and a --windowed PyInstaller build never has a console to begin
     # with, so this whole relaunch dance is dev-run-only.
-    if (not test_mode and '--debug-html' not in args and '--no-relaunch' not in args
-            and not getattr(sys, 'frozen', False)):
+    if (IS_WINDOWS and not test_mode and '--debug-html' not in args
+            and '--no-relaunch' not in args and not getattr(sys, 'frozen', False)):
         exe = sys.executable
         if exe.lower().endswith('python.exe'):
             pythonw = exe[:-len('python.exe')] + 'pythonw.exe'
@@ -2171,18 +2540,21 @@ Admin privileges required for website blocking.""")
 
     # ---- Admin check ----
     if not check_admin_privileges():
+        if IS_LINUX:
+            admin_msg = ("The hosts-file helper isn't installed.\n"
+                         "Website blocking needs a one-time setup. In a terminal, run:\n\n"
+                         "    sudo ./linux/install.sh")
+        else:
+            admin_msg = ("Not running as administrator!\n"
+                         "Website blocking requires admin privileges.\n\n"
+                         "Right-click the script and choose 'Run as administrator'.")
         if test_mode or debug_html:
-            print("WARNING: Not running as administrator! Website blocking will not work.")
+            print("WARNING: " + admin_msg.replace("\n", " "))
         else:
             try:
                 _r = tk.Tk()
                 _r.withdraw()
-                messagebox.showwarning(
-                    "Migaku Enforcer",
-                    "Not running as administrator!\n"
-                    "Website blocking requires admin privileges.\n\n"
-                    "Right-click the script and choose 'Run as administrator'."
-                )
+                messagebox.showwarning("Migaku Enforcer", admin_msg)
                 _r.destroy()
             except Exception:
                 pass

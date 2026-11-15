@@ -25,8 +25,8 @@ from migaku_enforcer import (
     DEFAULT_BLOCKED_DOMAINS, DEFAULT_BLOCKED_APPS, DEFAULT_DAILY_REVIEW_GOAL,
     DEFAULT_RESET_HOUR, DEFAULT_EMERGENCY_PASSES_ENABLED,
     DEFAULT_EMERGENCY_PASSES_PER_MONTH, DEFAULT_CHECK_INTERVAL_MINUTES,
-    DEFAULT_BLOCKED_APPS_EXACT_MATCH,
-    check_admin_privileges, install_startup,
+    DEFAULT_BLOCKED_APPS_EXACT_MATCH, REVIEW_COUNT_VACATION,
+    check_admin_privileges, install_startup, STARTUP_NEEDS_ADMIN, IS_WINDOWS,
 )
 
 WINDOW_WIDTH = 480
@@ -225,7 +225,12 @@ class WizardWindow(tk.Tk):
         def on_result(count, error_kind):
             test_btn.config(state='normal', text="Test Login")
             chrome_link.pack_forget()
-            if error_kind is None:
+            if error_kind is None and count == REVIEW_COUNT_VACATION:
+                result_label.config(
+                    text="✓ Login successful! Migaku is in vacation mode today — "
+                         "no reviews due, so nothing will be restricted.",
+                    fg=FG_GOOD)
+            elif error_kind is None:
                 result_label.config(
                     text=f"✓ Login successful! You have {count} review(s) pending.",
                     fg=FG_GOOD)
@@ -304,8 +309,9 @@ class WizardWindow(tk.Tk):
             frame, wraplength=WINDOW_WIDTH - 40, justify='left', font=FONT_SMALL,
             fg=FG_MUTED, bg=BG,
             text="Recommended — starts Migaku Enforcer automatically when you log in, "
-                 "so it can't be skipped by just not opening it. Requires administrator "
-                 "privileges (you may see a permissions prompt)."
+                 "so it can't be skipped by just not opening it."
+                 + (" Requires administrator privileges (you may see a permissions prompt)."
+                    if STARTUP_NEEDS_ADMIN else "")
         ).pack(anchor='w', pady=(0, 10))
 
         tk.Checkbutton(
@@ -322,7 +328,7 @@ class WizardWindow(tk.Tk):
             fg=FG_MUTED, bg=BG,
             text="Click Finish to save your settings and start Migaku Enforcer.\n\n"
                  "Your Migaku password is stored in a local config file on this "
-                 "computer, protected by your Windows account's file permissions — "
+                 "computer, protected by your " + ("Windows account's" if IS_WINDOWS else "user account's") + " file permissions — "
                  "don't use this on a shared computer.\n\n"
                  "You can change any of these settings later from the Settings button."
         ).pack(anchor='w')
@@ -355,7 +361,7 @@ class WizardWindow(tk.Tk):
         self.enforcer.save_config()
 
         if self._startup_var.get():
-            if check_admin_privileges():
+            if not STARTUP_NEEDS_ADMIN or check_admin_privileges():
                 install_startup(self.enforcer.config['reset_hour'])
                 self.enforcer.config['install_to_startup'] = True
                 self.enforcer.save_config()

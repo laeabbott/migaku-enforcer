@@ -91,7 +91,9 @@ def test_login():
 
             count = enforcer.get_review_count()
 
-            if count >= 0:
+            if count == -2:  # REVIEW_COUNT_VACATION
+                print("✅ Login test successful! Migaku is in vacation mode today (no reviews due).")
+            elif count >= 0:
                 print(f"✅ Login test successful! Review count: {count}")
             else:
                 print("❌ Login test failed. Check the browser window for details.")

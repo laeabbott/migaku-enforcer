@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Run this script once to register Migaku Enforcer as a startup task.
-It will ask for administrator permission via the UAC prompt.
+Windows: asks for administrator permission via the UAC prompt.
+Linux:   installs systemd user units (no root needed).
 """
 import sys
 import os
@@ -26,7 +27,7 @@ def relaunch_as_admin():
     return int(ret) > 32
 
 
-if not is_admin():
+if sys.platform == 'win32' and not is_admin():
     print("Requesting administrator privileges...")
     if relaunch_as_admin():
         sys.exit(0)
@@ -47,7 +48,7 @@ print("Migaku Enforcer - Startup Installation")
 print("=" * 50)
 print()
 
-if not check_admin_privileges():
+if sys.platform == 'win32' and not check_admin_privileges():
     print("ERROR: Still not running as administrator. Cannot continue.")
     input("Press Enter to exit.")
     sys.exit(1)
@@ -58,5 +59,7 @@ install_startup(reset_hour)
 print()
 print("Done! Migaku Enforcer will now start automatically when you log in.")
 print("The GUI window will appear ~30 seconds after login.")
+if sys.platform != 'win32':
+    print("Check status with: systemctl --user status migaku-enforcer.timer")
 print()
 input("Press Enter to close this window.")

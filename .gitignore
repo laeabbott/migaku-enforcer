@@ -15,3 +15,4 @@ migaku_debug.txt
 
 # Local dev tooling, not part of the project
 .claude/
+.venv/

@@ -1,0 +1,129 @@
+#!/usr/bin/python3 -I
+"""
+Privileged /etc/hosts editor for Migaku Enforcer (Linux).
+
+Migaku Enforcer itself runs as your normal user. The one thing that needs root is
+editing /etc/hosts, so that is split out into this tiny helper. install.sh copies
+it to a root-owned location and adds a sudoers rule allowing *only this file* to
+be run without a password.
+
+Because it can be run as root by an unprivileged user, it is deliberately narrow:
+
+  * it only ever adds/removes lines carrying the MIGAKU_ENFORCER_BLOCKED marker,
+  * it only writes "127.0.0.1 <domain>" entries for syntactically valid,
+    multi-label domain names (no whitespace, no comments, no "localhost"),
+  * it never reads or writes any file other than /etc/hosts.
+
+Usage (as root):
+    migaku-hosts-helper check
+    migaku-hosts-helper block <domain> [<domain> ...]
+    migaku-hosts-helper unblock
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HOSTS_PATH = "/etc/hosts"
+MARKER = "# MIGAKU_ENFORCER_BLOCKED"
+
+_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+DOMAIN_RE = re.compile(rf"^(?:{_LABEL}\.)+{_LABEL}$")
+
+
+def normalize_domains(domains):
+    """Return (valid, rejected): lowercased, de-duplicated, order preserved."""
+    valid, rejected, seen = [], [], set()
+    for raw in domains:
+        d = raw.strip().lower().rstrip(".")
+        if len(d) <= 253 and DOMAIN_RE.match(d):
+            if d not in seen:
+                seen.add(d)
+                valid.append(d)
+        else:
+            rejected.append(raw)
+    return valid, rejected
+
+
+def render_hosts(current, domains):
+    """Pure function: hosts file text with our block (re)applied or removed."""
+    kept = [ln for ln in current.split("\n") if MARKER not in ln]
+    body = "\n".join(kept).rstrip("\n")
+    if domains:
+        entries = []
+        for d in domains:
+            entries.append(f"127.0.0.1 {d} {MARKER}")
+            entries.append(f"127.0.0.1 www.{d} {MARKER}")
+        body = body + "\n\n" + "\n".join(entries)
+    return body + "\n"
+
+
+def write_atomically(path, text):
+    """Replace `path` with `text`, keeping its mode/owner, following symlinks."""
+    real = os.path.realpath(path)
+    st = os.stat(real)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix=".hosts.migaku.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, st.st_mode & 0o7777)
+        os.chown(tmp, st.st_uid, st.st_gid)
+        os.replace(tmp, real)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def flush_caches():
+    """Best effort: nothing here is fatal, glibc re-reads /etc/hosts anyway."""
+    for cmd in (["resolvectl", "flush-caches"], ["nscd", "-i", "hosts"]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=10)
+            except Exception:
+                pass
+
+
+def apply(action, domains, hosts_path=HOSTS_PATH):
+    with open(hosts_path, "r", encoding="utf-8", errors="replace") as f:
+        current = f.read()
+    write_atomically(hosts_path, render_hosts(current, domains if action == "block" else []))
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] not in ("check", "block", "unblock"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    if os.geteuid() != 0:
+        print("migaku-hosts-helper must run as root (via sudo)", file=sys.stderr)
+        return 1
+
+    action = argv[1]
+    if action == "check":
+        print("ok")
+        return 0
+
+    domains = []
+    if action == "block":
+        domains, rejected = normalize_domains(argv[2:])
+        for r in rejected:
+            print(f"ignoring invalid domain: {r!r}", file=sys.stderr)
+        if not domains:
+            print("no valid domains to block", file=sys.stderr)
+            return 3
+
+    apply(action, domains)
+    flush_caches()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
