@@ -2468,6 +2468,61 @@ def show_startup_banner():
     print("Please wait...\n")
 
 
+# Held for the life of the process; the OS releases it when the process exits
+# (even on a crash or a Task Manager kill), so a stale lock can't block startup.
+_single_instance_handle = None
+
+SINGLE_INSTANCE_MUTEX = "Local\\MigakuEnforcer.SingleInstance"
+
+
+def acquire_single_instance_lock() -> bool:
+    """
+    Return True if this is the only running enforcer, False if one already runs.
+
+    Task Scheduler's MultipleInstancesPolicy=IgnoreNew only knows about copies it
+    started itself, so a copy launched any other way (shortcut, post-update
+    relaunch) plus the task's daily reset-hour trigger — or its missed-run
+    catch-up after sleep — gave two enforcers. This lock is app-level, so it
+    holds however each copy was launched.
+
+    Windows: a named mutex in the session namespace. An elevated copy's mutex
+    can't be opened by a non-elevated launch (ERROR_ACCESS_DENIED), which also
+    means "already running". Linux: an exclusive flock on a file in the app dir.
+    Fails open (returns True) if the lock mechanism itself errors, so a lock
+    problem can never stop the enforcer from running at all.
+    """
+    global _single_instance_handle
+    try:
+        if IS_WINDOWS:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+            kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+            handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX)
+            err = ctypes.get_last_error()
+            ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS = 5, 183
+            if not handle:
+                return err != ERROR_ACCESS_DENIED
+            if err == ERROR_ALREADY_EXISTS:
+                kernel32.CloseHandle(handle)
+                return False
+            _single_instance_handle = handle
+            return True
+        import fcntl
+        lock_file = open(get_app_data_dir() / "instance.lock", 'w')
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_file.close()
+            return False
+        _single_instance_handle = lock_file
+        return True
+    except Exception as e:
+        log('warning', f"Single-instance check failed, continuing anyway: {e}")
+        return True
+
+
 def _notify(message: str, title: str = "Migaku Enforcer", is_error: bool = False) -> None:
     """
     Show a message to the user regardless of whether a console is attached.
@@ -2571,6 +2626,17 @@ Admin privileges required for website blocking.""")
 
     # ---- Set up logging ----
     setup_logging(test_mode=test_mode or debug_html)
+
+    # ---- Only one real enforcer at a time ----
+    # Test/debug runs never block anything, so they're exempt and can still run
+    # next to the real one while developing.
+    if not (test_mode or debug_html) and not acquire_single_instance_lock():
+        if '--scheduled' in args:
+            log('info', "Another Migaku Enforcer is already running; scheduled launch exiting.")
+        else:
+            _notify("Migaku Enforcer is already running.\n\n"
+                    "Look for its window or its tray icon.")
+        return
 
     # ---- Admin check ----
     if not check_admin_privileges():
